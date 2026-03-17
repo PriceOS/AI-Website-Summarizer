@@ -3,6 +3,10 @@
 Minimal AI-powered Next.js app that fetches a webpage, extracts readable text,
 and streams back a concise summary using OpenAI.
 
+## Video Walkthrough
+
+Watch the build walkthrough on YouTube: [How to create this app](https://www.youtube.com/watch?v=zaADxlP3b5c&t=1s)
+
 ## Stack
 
 - Next.js App Router
