@@ -18,11 +18,16 @@ Watch the build walkthrough on YouTube: [How to create this app](https://www.you
 
 ## Local Development
 
-Create a local environment file with your OpenAI key:
+Create a local environment file with your OpenAI key and Supabase project values:
 
 ```bash
 OPENAI_API_KEY=your_key_here
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your_supabase_publishable_key
 ```
+
+For password auth without email verification, disable `Confirm email` in the
+Supabase dashboard under Authentication > Providers > Email.
 
 Then run:
 
