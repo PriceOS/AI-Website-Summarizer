@@ -4,6 +4,7 @@ import { openai } from "@ai-sdk/openai";
 import { createStreamableValue } from "@ai-sdk/rsc";
 import { streamText } from "ai";
 import * as cheerio from "cheerio";
+import { getSupabaseServerClient } from "@/lib/supabase/server";
 
 const MAX_WEBPAGE_CHARS = 12000;
 
@@ -59,6 +60,16 @@ export async function summarizeWebsite(rawUrl: string) {
 
   (async () => {
     try {
+      const supabase = await getSupabaseServerClient();
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
+
+      if (authError || !user) {
+        throw new Error("Log in to summarize websites.");
+      }
+
       const url = validateUrl(rawUrl.trim());
 
       const response = await fetch(url, {

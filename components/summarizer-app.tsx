@@ -6,6 +6,14 @@ import {
   type AccountSettingsMode,
 } from "./account-settings-dialog";
 import { AuthDialog, type AuthMode } from "./auth-dialog";
+import { BillingDialog } from "./billing-dialog";
+import {
+  BILLING_PROFILE_SELECT_COLUMNS,
+  serializeBillingProfile,
+  getDefaultBillingProfile,
+  type BillingProfileRow,
+} from "@/lib/billing/format";
+import type { BillingInterval, BillingProfile, PlanKey } from "@/lib/billing/types";
 import {
   getSupabaseBrowserClient,
   getSupabaseConfigError,
@@ -29,7 +37,21 @@ import TextField from "@mui/material/TextField";
 import Toolbar from "@mui/material/Toolbar";
 import Typography from "@mui/material/Typography";
 import type { Session } from "@supabase/supabase-js";
-import { useEffect, useState, type FormEvent, type MouseEvent } from "react";
+import { useSearchParams } from "next/navigation";
+import {
+  useEffect,
+  useEffectEvent,
+  useState,
+  type FormEvent,
+  type MouseEvent,
+} from "react";
+
+type BillingActionResponse = {
+  error?: string;
+  mode?: "noop" | "redirect" | "scheduled" | "updated";
+  profile?: BillingProfile;
+  url?: string;
+};
 
 export function SummarizerApp() {
   const [accountMenuAnchor, setAccountMenuAnchor] = useState<HTMLElement | null>(null);
@@ -44,7 +66,14 @@ export function SummarizerApp() {
   const [summary, setSummary] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
+  const [billingProfile, setBillingProfile] = useState<BillingProfile>(getDefaultBillingProfile());
+  const [billingDialogOpen, setBillingDialogOpen] = useState(false);
+  const [billingError, setBillingError] = useState("");
+  const [billingNotice, setBillingNotice] = useState("");
+  const [billingNoticeSeverity, setBillingNoticeSeverity] = useState<"info" | "success">("info");
+  const [isBillingSubmitting, setIsBillingSubmitting] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
+  const searchParams = useSearchParams();
 
   useEffect(() => {
     const configError = getSupabaseConfigError();
@@ -98,6 +127,73 @@ export function SummarizerApp() {
     };
   }, []);
 
+  const refreshBillingProfile = useEffectEvent(async (activeSession: Session | null) => {
+    if (!activeSession) {
+      setBillingProfile(getDefaultBillingProfile());
+      return;
+    }
+
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { data, error: billingProfileError } = await supabase
+        .from("billing_profiles")
+        .select(BILLING_PROFILE_SELECT_COLUMNS)
+        .eq("user_id", activeSession.user.id)
+        .maybeSingle();
+
+      if (billingProfileError) {
+        throw billingProfileError;
+      }
+
+      setBillingProfile(serializeBillingProfile(data as BillingProfileRow | null));
+    } catch (caughtError) {
+      setAuthError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Unable to load the current billing profile.",
+      );
+    }
+  });
+
+  useEffect(() => {
+    void refreshBillingProfile(session);
+  }, [session]);
+
+  useEffect(() => {
+    const billingState = searchParams.get("billing");
+
+    if (!session || !billingState) {
+      return;
+    }
+
+    if (billingState === "cancelled") {
+      setBillingNotice("Stripe Checkout was cancelled before any billing changes were applied.");
+      setBillingNoticeSeverity("info");
+      return;
+    }
+
+    if (billingState !== "success") {
+      return;
+    }
+
+    setBillingNotice("Finalizing your subscription. This page will refresh your plan state shortly.");
+    setBillingNoticeSeverity("success");
+
+    let attempts = 0;
+    const interval = window.setInterval(() => {
+      attempts += 1;
+      void refreshBillingProfile(session);
+
+      if (attempts >= 5) {
+        window.clearInterval(interval);
+      }
+    }, 1500);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [searchParams, session]);
+
   const openAuthDialog = (mode: AuthMode) => {
     setAuthError("");
     setAuthDialogMode(mode);
@@ -119,6 +215,85 @@ export function SummarizerApp() {
     handleAccountMenuClose();
   };
 
+  const handleOpenBillingDialog = () => {
+    setBillingError("");
+    setBillingDialogOpen(true);
+    handleAccountMenuClose();
+  };
+
+  const handleBillingPlanSelection = async (planKey: PlanKey, billingInterval: BillingInterval) => {
+    setBillingError("");
+    setIsBillingSubmitting(true);
+
+    try {
+      const response = await fetch("/api/billing/subscribe", {
+        body: JSON.stringify({
+          billingInterval,
+          planKey,
+        }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        method: "POST",
+      });
+      const payload = (await response.json()) as BillingActionResponse;
+
+      if (!response.ok || payload.error) {
+        throw new Error(payload.error ?? "Unable to update the billing plan.");
+      }
+
+      if (payload.mode === "redirect" && payload.url) {
+        window.location.assign(payload.url);
+        return;
+      }
+
+      if (payload.profile) {
+        setBillingProfile(payload.profile);
+      }
+
+      setBillingNotice(
+        payload.mode === "scheduled"
+          ? "Your plan change has been scheduled for the next renewal."
+          : "Your billing plan has been updated.",
+      );
+      setBillingNoticeSeverity("success");
+      setBillingDialogOpen(false);
+    } catch (caughtError) {
+      setBillingError(
+        caughtError instanceof Error ? caughtError.message : "Unable to update the billing plan.",
+      );
+    } finally {
+      setIsBillingSubmitting(false);
+    }
+  };
+
+  const handleOpenCustomerPortal = async () => {
+    setBillingError("");
+    handleAccountMenuClose();
+    setIsBillingSubmitting(true);
+
+    try {
+      const response = await fetch("/api/billing/portal", {
+        method: "POST",
+      });
+      const payload = (await response.json()) as { error?: string; url?: string };
+
+      if (!response.ok || payload.error || !payload.url) {
+        throw new Error(payload.error ?? "Unable to open the Stripe customer portal.");
+      }
+
+      window.location.assign(payload.url);
+    } catch (caughtError) {
+      setBillingError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Unable to open the Stripe customer portal.",
+      );
+    } finally {
+      setIsBillingSubmitting(false);
+    }
+  };
+
   const handleSignOut = async () => {
     setAuthError("");
     handleAccountMenuClose();
@@ -134,6 +309,10 @@ export function SummarizerApp() {
       setError("");
       setSummary("");
       setUrl("");
+      setBillingDialogOpen(false);
+      setBillingError("");
+      setBillingNotice("");
+      setBillingProfile(getDefaultBillingProfile());
       setAccountSettingsOpen(false);
     } catch (caughtError) {
       setAuthError(caughtError instanceof Error ? caughtError.message : "Unable to log out.");
@@ -192,6 +371,11 @@ export function SummarizerApp() {
             <CircularProgress size={24} />
           ) : session ? (
             <>
+              {!billingProfile.isPaid ? (
+                <Button onClick={handleOpenBillingDialog} variant="contained">
+                  Upgrade
+                </Button>
+              ) : null}
               <IconButton onClick={handleAccountMenuOpen} size="small">
                 <Avatar sx={{ bgcolor: "primary.main", height: 36, width: 36 }}>
                   {avatarLabel}
@@ -203,6 +387,12 @@ export function SummarizerApp() {
                 open={Boolean(accountMenuAnchor)}
               >
                 <MenuItem disabled>{session.user.email ?? "Signed in"}</MenuItem>
+                <MenuItem onClick={handleOpenBillingDialog}>
+                  {billingProfile.isPaid ? "Billing" : "Upgrade"}
+                </MenuItem>
+                {billingProfile.isPaid ? (
+                  <MenuItem onClick={handleOpenCustomerPortal}>Payment Methods</MenuItem>
+                ) : null}
                 <MenuItem onClick={() => handleOpenAccountSettings("email")}>
                   Update Email
                 </MenuItem>
@@ -237,6 +427,11 @@ export function SummarizerApp() {
         <Stack spacing={3}>
           {authConfigError ? <Alert severity="warning">{authConfigError}</Alert> : null}
           {authError ? <Alert severity="error">{authError}</Alert> : null}
+          {billingNotice ? (
+            <Alert onClose={() => setBillingNotice("")} severity={billingNoticeSeverity}>
+              {billingNotice}
+            </Alert>
+          ) : null}
 
           <Paper
             elevation={0}
@@ -336,6 +531,17 @@ export function SummarizerApp() {
         onClose={() => setAccountSettingsOpen(false)}
         open={accountSettingsOpen}
       />
+      {billingDialogOpen ? (
+        <BillingDialog
+          billingProfile={billingProfile}
+          error={billingError}
+          isSubmitting={isBillingSubmitting}
+          onClose={() => setBillingDialogOpen(false)}
+          onOpenPortal={handleOpenCustomerPortal}
+          onSelectPlan={handleBillingPlanSelection}
+          open={billingDialogOpen}
+        />
+      ) : null}
     </Box>
   );
 }
