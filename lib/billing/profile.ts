@@ -1,6 +1,7 @@
 import type Stripe from "stripe";
 import { BILLING_PROFILE_SELECT_COLUMNS, type BillingProfileRow } from "./format";
 import { getBillingInterval, getMonthlyCreditsForPlan, getPlanFromStripePriceId } from "./plans";
+import { syncUserCreditsFromBillingProfile } from "@/lib/credits/service";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 
 function toIsoString(unixTimestamp: number | null | undefined) {
@@ -167,7 +168,7 @@ export async function syncBillingProfileFromSubscription(subscription: Stripe.Su
   }
 
   if (subscription.status === "canceled") {
-    return updateBillingProfile(existingProfile.user_id, {
+    const profile = await updateBillingProfile(existingProfile.user_id, {
       billing_interval: "month",
       cancel_at_period_end: false,
       current_period_end: null,
@@ -180,6 +181,16 @@ export async function syncBillingProfileFromSubscription(subscription: Stripe.Su
       stripe_subscription_id: null,
       subscription_status: "free",
     });
+
+    await syncUserCreditsFromBillingProfile(existingProfile.user_id, {
+      metadata: {
+        source: "stripe_webhook",
+        stripeSubscriptionId: subscription.id,
+      },
+      reason: "billing_sync",
+    });
+
+    return profile;
   }
 
   const subscriptionItem = subscription.items.data[0];
@@ -190,7 +201,7 @@ export async function syncBillingProfileFromSubscription(subscription: Stripe.Su
     existingProfile.pending_plan_key === planKey &&
     existingProfile.pending_billing_interval === billingInterval;
 
-  return updateBillingProfile(existingProfile.user_id, {
+  const profile = await updateBillingProfile(existingProfile.user_id, {
     billing_interval: billingInterval,
     cancel_at_period_end: subscription.cancel_at_period_end,
     current_period_end: toIsoString(subscriptionItem?.current_period_end),
@@ -212,4 +223,14 @@ export async function syncBillingProfileFromSubscription(subscription: Stripe.Su
     stripe_subscription_id: subscription.id,
     subscription_status: subscription.status,
   });
+
+  await syncUserCreditsFromBillingProfile(existingProfile.user_id, {
+    metadata: {
+      source: "stripe_webhook",
+      stripeSubscriptionId: subscription.id,
+    },
+    reason: "billing_sync",
+  });
+
+  return profile;
 }

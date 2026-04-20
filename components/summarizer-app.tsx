@@ -9,11 +9,14 @@ import { AuthDialog, type AuthMode } from "./auth-dialog";
 import { BillingDialog } from "./billing-dialog";
 import {
   BILLING_PROFILE_SELECT_COLUMNS,
-  serializeBillingProfile,
   getDefaultBillingProfile,
+  serializeBillingProfile,
   type BillingProfileRow,
 } from "@/lib/billing/format";
 import type { BillingInterval, BillingProfile, PlanKey } from "@/lib/billing/types";
+import { getDefaultUserCredits } from "@/lib/credits/format";
+import { CREDITS_EXHAUSTED_MESSAGE } from "@/lib/credits/service";
+import type { UserCredits } from "@/lib/credits/types";
 import {
   getSupabaseBrowserClient,
   getSupabaseConfigError,
@@ -53,6 +56,11 @@ type BillingActionResponse = {
   url?: string;
 };
 
+type CreditsResponse = {
+  credits?: UserCredits;
+  error?: string;
+};
+
 export function SummarizerApp() {
   const [accountMenuAnchor, setAccountMenuAnchor] = useState<HTMLElement | null>(null);
   const [accountSettingsMode, setAccountSettingsMode] = useState<AccountSettingsMode>("email");
@@ -73,6 +81,7 @@ export function SummarizerApp() {
   const [billingNoticeSeverity, setBillingNoticeSeverity] = useState<"info" | "success">("info");
   const [isBillingSubmitting, setIsBillingSubmitting] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
+  const [userCredits, setUserCredits] = useState<UserCredits>(getDefaultUserCredits());
   const searchParams = useSearchParams();
 
   useEffect(() => {
@@ -127,25 +136,50 @@ export function SummarizerApp() {
     };
   }, []);
 
-  const refreshBillingProfile = useEffectEvent(async (activeSession: Session | null) => {
+  const loadCredits = async (activeSession: Session | null) => {
+    if (!activeSession) {
+      setUserCredits(getDefaultUserCredits());
+      return getDefaultUserCredits();
+    }
+
+    const response = await fetch("/api/credits", {
+      method: "GET",
+    });
+    const payload = (await response.json()) as CreditsResponse;
+
+    if (!response.ok || payload.error || !payload.credits) {
+      throw new Error(payload.error ?? "Unable to load the current credits.");
+    }
+
+    setUserCredits(payload.credits);
+
+    return payload.credits;
+  };
+
+  const refreshAccountState = useEffectEvent(async (activeSession: Session | null) => {
     if (!activeSession) {
       setBillingProfile(getDefaultBillingProfile());
+      setUserCredits(getDefaultUserCredits());
       return;
     }
 
     try {
       const supabase = getSupabaseBrowserClient();
-      const { data, error: billingProfileError } = await supabase
-        .from("billing_profiles")
-        .select(BILLING_PROFILE_SELECT_COLUMNS)
-        .eq("user_id", activeSession.user.id)
-        .maybeSingle();
+      const [{ data, error: billingProfileError }, credits] = await Promise.all([
+        supabase
+          .from("billing_profiles")
+          .select(BILLING_PROFILE_SELECT_COLUMNS)
+          .eq("user_id", activeSession.user.id)
+          .maybeSingle(),
+        loadCredits(activeSession),
+      ]);
 
       if (billingProfileError) {
         throw billingProfileError;
       }
 
       setBillingProfile(serializeBillingProfile(data as BillingProfileRow | null));
+      setUserCredits(credits);
     } catch (caughtError) {
       setAuthError(
         caughtError instanceof Error
@@ -156,7 +190,7 @@ export function SummarizerApp() {
   });
 
   useEffect(() => {
-    void refreshBillingProfile(session);
+    void refreshAccountState(session);
   }, [session]);
 
   useEffect(() => {
@@ -182,7 +216,7 @@ export function SummarizerApp() {
     let attempts = 0;
     const interval = window.setInterval(() => {
       attempts += 1;
-      void refreshBillingProfile(session);
+      void refreshAccountState(session);
 
       if (attempts >= 5) {
         window.clearInterval(interval);
@@ -251,6 +285,8 @@ export function SummarizerApp() {
         setBillingProfile(payload.profile);
       }
 
+      await loadCredits(session);
+
       setBillingNotice(
         payload.mode === "scheduled"
           ? "Your plan change has been scheduled for the next renewal."
@@ -313,6 +349,7 @@ export function SummarizerApp() {
       setBillingError("");
       setBillingNotice("");
       setBillingProfile(getDefaultBillingProfile());
+      setUserCredits(getDefaultUserCredits());
       setAccountSettingsOpen(false);
     } catch (caughtError) {
       setAuthError(caughtError instanceof Error ? caughtError.message : "Unable to log out.");
@@ -320,6 +357,10 @@ export function SummarizerApp() {
   };
 
   const avatarLabel = session?.user.email?.trim().charAt(0).toUpperCase() ?? "U";
+  const creditUsagePercent =
+    userCredits.monthlyAllowance > 0
+      ? Math.min(100, Math.max(0, (userCredits.balance / userCredits.monthlyAllowance) * 100))
+      : 0;
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -329,20 +370,46 @@ export function SummarizerApp() {
       return;
     }
 
+    try {
+      const latestCredits = await loadCredits(session);
+
+      if (latestCredits.balance <= 0) {
+        setError(CREDITS_EXHAUSTED_MESSAGE);
+        setBillingError(CREDITS_EXHAUSTED_MESSAGE);
+        setBillingDialogOpen(true);
+        return;
+      }
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error ? caughtError.message : "Unable to load the current credits.",
+      );
+      return;
+    }
+
     setIsLoading(true);
     setError("");
     setSummary("");
 
     try {
-      const stream = await summarizeWebsite(url);
+      const result = await summarizeWebsite(url);
       let nextSummary = "";
 
-      for await (const delta of readStreamableValue(stream)) {
+      for await (const delta of readStreamableValue(result.stream)) {
         nextSummary += delta;
         setSummary(nextSummary);
       }
+
+      await loadCredits(session);
     } catch (caughtError) {
-      setError(caughtError instanceof Error ? caughtError.message : "Something went wrong.");
+      const message = caughtError instanceof Error ? caughtError.message : "Something went wrong.";
+      setError(message);
+
+      if (message === CREDITS_EXHAUSTED_MESSAGE) {
+        setBillingError(message);
+        setBillingDialogOpen(true);
+      }
+
+      await loadCredits(session).catch(() => undefined);
     } finally {
       setIsLoading(false);
     }
@@ -376,6 +443,50 @@ export function SummarizerApp() {
                   Upgrade
                 </Button>
               ) : null}
+              <Stack alignItems="center" direction="row" spacing={1}>
+                <Box sx={{ position: "relative" }}>
+                  <CircularProgress
+                    size={38}
+                    sx={{
+                      color: "rgba(21, 101, 192, 0.14)",
+                      left: 0,
+                      position: "absolute",
+                      top: 0,
+                    }}
+                    thickness={5}
+                    value={100}
+                    variant="determinate"
+                  />
+                  <CircularProgress
+                    color={userCredits.balance > 0 ? "primary" : "warning"}
+                    size={38}
+                    thickness={5}
+                    value={creditUsagePercent}
+                    variant="determinate"
+                  />
+                  <Box
+                    sx={{
+                      alignItems: "center",
+                      display: "flex",
+                      inset: 0,
+                      justifyContent: "center",
+                      position: "absolute",
+                    }}
+                  >
+                    <Typography fontSize={11} fontWeight={700}>
+                      {userCredits.balance}
+                    </Typography>
+                  </Box>
+                </Box>
+                <Box sx={{ minWidth: 72 }}>
+                  <Typography fontSize={11} fontWeight={700} lineHeight={1.1}>
+                    Credits
+                  </Typography>
+                  <Typography color="text.secondary" fontSize={11} lineHeight={1.1}>
+                    {userCredits.balance} / {userCredits.monthlyAllowance}
+                  </Typography>
+                </Box>
+              </Stack>
               <IconButton onClick={handleAccountMenuOpen} size="small">
                 <Avatar sx={{ bgcolor: "primary.main", height: 36, width: 36 }}>
                   {avatarLabel}
@@ -448,6 +559,11 @@ export function SummarizerApp() {
                 <Typography color="text.secondary">
                   Paste a webpage URL and get a concise streamed summary powered by OpenAI.
                 </Typography>
+                {session ? (
+                  <Typography color="text.secondary" sx={{ mt: 1 }}>
+                    {userCredits.balance} of {userCredits.monthlyAllowance} credits remaining.
+                  </Typography>
+                ) : null}
               </Box>
 
               <TextField
@@ -468,7 +584,11 @@ export function SummarizerApp() {
                   type="submit"
                   variant="contained"
                 >
-                  {isLoading ? "Summarizing..." : "Summarize"}
+                  {isLoading
+                    ? "Summarizing..."
+                    : session && userCredits.balance <= 0
+                      ? "Upgrade to continue"
+                      : "Summarize"}
                 </Button>
               </Box>
             </Stack>
